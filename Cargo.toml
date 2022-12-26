@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "victron_solar_monitor",
+    "delay_bms_monitor",
+    "mqtt_consumer"
+]

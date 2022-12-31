@@ -3,6 +3,7 @@ mod schema_guesser;
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -71,7 +72,7 @@ struct Args {
     topics: Vec<String>,
 }
 
-fn parse_topics(topics: Vec<String>) -> Vec<(String, String)> {
+fn parse_topics(topics: Vec<String>) -> BTreeMap<String, String> {
     topics
         .iter()
         .map(|topic| {
@@ -105,11 +106,11 @@ async fn check_topic_table(pool: Pool<PostgresConnectionManager<NoTls>>, table: 
 
 async fn message_handler(
     pool: Pool<PostgresConnectionManager<NoTls>>,
-    topic: String,
+    table: &String,
     payload: serde_json::Value,
 ) {
     let conn = pool.get().await.unwrap();
-    trace!("Received message on topic {topic}");
+    trace!("Writing '{payload:?} to table '{table}");
 
     let payload = payload.as_object().unwrap();
     let keys = payload
@@ -120,8 +121,6 @@ async fn message_handler(
         .values()
         .map(|v| v.to_string())
         .collect::<Vec<String>>();
-
-    let table = topic.replace('/', "_");
 
     let mut var_string = String::new();
     for i in 1..keys.len() {
@@ -141,33 +140,41 @@ async fn message_handler(
     conn.execute_raw(&stmt, values).await.unwrap();
 }
 
-/// Comsume messages from the MQTT broker channel and write them to the database.
+/// Consume messages from the MQTT broker channel and write them to the database.
 async fn message_consumer(
     pool: Pool<PostgresConnectionManager<NoTls>>,
     mut rx: Receiver<DbChannelType>,
-    topic_map: Vec<(String, String)>,
+    topic_map: BTreeMap<String, String>,
+    guess_schema: bool,
 ) {
-    let mut seen_tables = vec![];
+    let mut seen_topics = vec![];
     while let Some((topic, payload)) = rx.recv().await {
-        if !seen_tables.contains(&topic) {
+        let target_table = topic_map.get(&topic).unwrap();
+        // check if we've already seen a message for this topic. if not, we should check if the
+        // table exists.
+        if !seen_topics.contains(&topic) {
             warn!("Topic {topic} has not been seen before. Checking if table exists.");
-            if check_topic_table(pool.clone(), &topic).await {
-                info!("Table {topic} exists. Continuing.");
-                seen_tables.push(topic.clone());
+            if check_topic_table(pool.clone(), target_table).await {
+                info!("Table for topic {topic} exists. Continuing.");
+                seen_topics.push(topic.clone());
             } else {
-                warn!("Table {topic} does not exist. Attempting to guess schema.");
-                let schema = schema_guesser::generate_schema_sql(&topic, &payload);
+                if !guess_schema {
+                    warn!("Table for topic {topic} does not exist. Guessing schema is disabled. Dropping message.");
+                    continue;
+                }
+                warn!("Table for topic {topic} does not exist. Attempting to guess schema.");
+                let schema = schema_guesser::generate_schema_sql(target_table, &payload);
                 let conn = pool.get().await.unwrap();
                 if let Err(e) = conn.execute(&schema, &[]).await {
                     error!("Failed to create table for topic {}: {}", &topic, e);
                     continue;
                 }
-                seen_tables.push(topic.clone());
-                info!("Table {topic} created. Continuing.");
+                seen_topics.push(topic.clone());
+                info!("Table for topic {topic} created. Continuing.");
             }
         }
 
-        message_handler(pool.clone(), topic, payload).await;
+        message_handler(pool.clone(), target_table, payload).await;
     }
 }
 
@@ -177,10 +184,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // connect to postgres
-    let config = tokio_postgres::config::Config::from_str(
-        "postgresql://postgres:mysecretpassword@localhost:5432",
-    )?;
-    let manager = PostgresConnectionManager::new(config, NoTls);
+    let manager = PostgresConnectionManager::new(
+        tokio_postgres::config::Config::from_str(args.db.as_str())?,
+        NoTls,
+    );
     let pool = Pool::builder().build(manager).await?;
 
     // connect to the mqtt broker
@@ -200,9 +207,12 @@ async fn main() -> anyhow::Result<()> {
     // Start database writer routine
     let (db_tx, db_rx): (Sender<DbChannelType>, Receiver<DbChannelType>) = channel(32);
     let consumer_pool = pool.clone();
-    tokio::spawn(async move { message_consumer(consumer_pool, db_rx, topic_map).await });
+    tokio::spawn(async move {
+        message_consumer(consumer_pool, db_rx, topic_map, args.db_guess_schema).await
+    });
 
-    // now, wait for mqtt messages to be recieved and when they are- push them to the database writer channel
+    // now, wait for mqtt messages to be received and when they are- push them to the database
+    // writer channel
     loop {
         if let Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) =
             eventloop.poll().await

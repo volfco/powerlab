@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use tokio_postgres::types::Type;
 
 enum TypeMappings {
     String,
@@ -7,7 +8,18 @@ enum TypeMappings {
     Json,
 }
 
-pub fn generate_schema_sql(table_name: &String, input: &serde_json::Value) -> String {
+pub fn guess_type(value: &serde_json::Value) -> Type {
+    match value {
+        serde_json::Value::String(_) => Type::TEXT,
+        serde_json::Value::Number(_) => Type::FLOAT8,
+        serde_json::Value::Bool(_) => Type::BOOL,
+        serde_json::Value::Array(_) => Type::JSON,
+        serde_json::Value::Object(_) => Type::JSON,
+        serde_json::Value::Null => Type::JSON,
+    }
+}
+
+pub fn generate_schema_sql(table_name: &String, input: &serde_json::Value) -> Vec<String> {
     if !input.is_object() {
         todo!("handle non-object input")
     }
@@ -15,39 +27,38 @@ pub fn generate_schema_sql(table_name: &String, input: &serde_json::Value) -> St
     // loop over each value in the object and get the type
     let mut schema = BTreeMap::new();
     for (key, value) in input.as_object().unwrap().iter() {
-        let type_mapping = match value {
-            serde_json::Value::String(_) => TypeMappings::String,
-            serde_json::Value::Number(_) => TypeMappings::Float,
-            serde_json::Value::Bool(_) => TypeMappings::Boolean,
-            serde_json::Value::Array(_) => TypeMappings::Json,
-            serde_json::Value::Object(_) => TypeMappings::Json,
-            serde_json::Value::Null => TypeMappings::Json,
-        };
-
-        schema.insert(key.to_string(), type_mapping);
+        schema.insert(key.to_string(), guess_type(value));
     }
 
     // now generate the sql
     let mut sql = String::new();
     for (key, value) in schema.iter() {
         let type_mapping = match value {
-            TypeMappings::String => "TEXT",
-            TypeMappings::Float => "FLOAT",
-            TypeMappings::Boolean => "BOOLEAN",
-            TypeMappings::Json => "JSON",
+            &Type::TEXT => "TEXT",
+            &Type::FLOAT8 => "FLOAT",
+            &Type::BOOL => "BOOLEAN",
+            &Type::JSON => "JSON",
+            _ => todo!("handle other types"),
         };
 
         sql.push_str(&format!("    {key} {type_mapping}, \n"));
     }
+    let _ = sql.pop();
+    let _ = sql.pop();
+    let _ = sql.pop();
 
-    let stmt = format!(
-        r"CREATE TABLE IF NOT EXISTS {table_name} (
+    let stmts = vec![
+        format!(
+            r"CREATE TABLE IF NOT EXISTS {table_name} (
     timestamp TIMESTAMP NOT NULL,
-{sql});
-CREATE INDEX ix_{table_name}_time ON {table_name} (timestamp);"
-    );
+{sql});"
+        ),
+        format!(
+            r"CREATE INDEX IF NOT EXISTS {table_name}_timestamp_idx ON {table_name} (timestamp);"
+        ),
+    ];
 
-    stmt
+    stmts
 }
 
 #[cfg(test)]

@@ -10,9 +10,10 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use serde_json::Value;
 use tokio_postgres::NoTls;
 
-type DbChannelType = (String, serde_json::Value);
+type DbChannelType = (String, Value);
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -37,7 +38,7 @@ struct Args {
     #[clap(
         short,
         long,
-        default_value = "postgresql://postgres:postgres@localhost:5432/postgres"
+        default_value = "postgresql://postgres:postgres@localhost:5432/postgres?connect_timeout=2"
     )]
     db: String,
 
@@ -95,7 +96,7 @@ async fn check_topic_table(pool: Pool<PostgresConnectionManager<NoTls>>, table: 
         pg_tables
     WHERE 
         schemaname = 'public' AND 
-        tablename  = '$1'
+        tablename  = $1
     );",
         )
         .await
@@ -104,40 +105,55 @@ async fn check_topic_table(pool: Pool<PostgresConnectionManager<NoTls>>, table: 
     row.get::<usize, bool>(0)
 }
 
+fn generate_sql(table: &String, data: &serde_json::Value) -> String {
+    let payload = data.as_object().unwrap();
+
+    let mut columns = String::new();
+    let mut values = String::new();
+
+    for (key, value) in payload {
+        if value.is_null() {
+            // skip null columns n stuff
+            continue;
+        }
+
+        columns.push_str(&format!("{key}, "));
+
+        let value = match value {
+            Value::Null => "NULL".to_string(),
+            Value::Bool(val) => format!("{val}, ",),
+            Value::Number(val) => format!("{val}, "),
+            Value::String(val) => format!("'{val}', "),
+            // Value::Array(val) => {val}
+            // Value::Object(val) => {}
+            _ => todo!(),
+        };
+        values.push_str(&value);
+    }
+
+    let _ = columns.pop();
+    let _ = values.pop();
+    let _ = columns.pop();
+    let _ = values.pop();
+
+    format!(
+        "INSERT INTO {} (timestamp, {}) VALUES (NOW(), {})",
+        &table, &columns, &values
+    )
+}
+
 async fn message_handler(
     pool: Pool<PostgresConnectionManager<NoTls>>,
     table: &String,
     payload: serde_json::Value,
 ) {
     let conn = pool.get().await.unwrap();
-    trace!("Writing '{payload:?} to table '{table}");
+    trace!("Writing '{payload:#?} to table '{table}");
 
-    let payload = payload.as_object().unwrap();
-    let keys = payload
-        .keys()
-        .map(|k| k.to_string())
-        .collect::<Vec<String>>();
-    let values = payload
-        .values()
-        .map(|v| v.to_string())
-        .collect::<Vec<String>>();
-
-    let mut var_string = String::new();
-    for i in 1..keys.len() {
-        var_string.push_str(&format!("${i}, "));
-    }
-
-    let stmt_sql = format!(
-        "INSERT INTO {} (timestamp, {}) VALUES (NOW(), {})",
-        &table,
-        &keys.join(", "),
-        &var_string
-    );
-
-    debug!("Executing Prepared Statement SQL: {}", stmt_sql);
+    let stmt_sql = generate_sql(table, &payload);
 
     let stmt = conn.prepare(&stmt_sql).await.unwrap();
-    conn.execute_raw(&stmt, values).await.unwrap();
+    trace!("result: {:?}", conn.execute(&stmt, &[]).await);
 }
 
 /// Consume messages from the MQTT broker channel and write them to the database.
@@ -165,9 +181,12 @@ async fn message_consumer(
                 warn!("Table for topic {topic} does not exist. Attempting to guess schema.");
                 let schema = schema_guesser::generate_schema_sql(target_table, &payload);
                 let conn = pool.get().await.unwrap();
-                if let Err(e) = conn.execute(&schema, &[]).await {
-                    error!("Failed to create table for topic {}: {}", &topic, e);
-                    continue;
+                for stmt in schema.iter() {
+                    // TODO Handle the case where the table already exists but the index does not.
+                    if let Err(e) = conn.execute(stmt.as_str(), &[]).await {
+                        error!("Failed to create table for topic {}: {}", &topic, e);
+                        continue;
+                    }
                 }
                 seen_topics.push(topic.clone());
                 info!("Table for topic {topic} created. Continuing.");
@@ -213,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
 
     // now, wait for mqtt messages to be received and when they are- push them to the database
     // writer channel
+    info!("listening for mqtt messages");
     loop {
         if let Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) =
             eventloop.poll().await
